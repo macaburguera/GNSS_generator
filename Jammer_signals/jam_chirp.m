@@ -1,31 +1,33 @@
-function y = jam_chirp(fs, N, bw_Hz, period_s, edge_win, osc_offset_Hz)
-% Sawtooth LFM baseband jammer: instantaneous frequency sweeps linearly
-% from -bw/2 to +bw/2 each period, then resets (sawtooth). Optional offset.
-% fs: sample rate; N: samples; bw_Hz: sweep BW; period_s: sweep period.
+function [x, meta] = jam_chirp(N, Fs, p)
+% Linear (slightly curved) chirp with sweep jitter + AM/PM and bursts
+t = (0:N-1).'/Fs;
 
-t = (0:N-1).' / fs;                  % column
-% phase increment rate (Hz/s) for linear sweep:
-f_start = -bw_Hz/2;
-f_end   = +bw_Hz/2;
-T = max(period_s, 1/fs);
-% Position inside period:
-tau = mod(t, T);
-% Instantaneous frequency:
-finst = f_start + (f_end - f_start) .* (tau / T);
+fc0  = getf(p,'fc0', 0.0);
+slope= getf(p,'slope', (Fs*0.4)/(2e-3));   % Hz/s
+curv = getf(p,'curv',  0.0);               % Hz/s^2
+sj   = getf(p,'sweepjit', 0.6);
+ap   = getf(p,'am_pm',[0.25 0.2]);
 
-% Optional cosmetic taper near edges to avoid clicks at reset:
-if edge_win > 0
-    ramp = 0.5 * (1 - cos(pi * min(tau, T - tau) / max(edge_win*T, eps)));
-    finst = finst .* (0.5 + 0.5 * ramp);
+% sweep law with small jitter (random lowpass noise)
+jit = filter(fir1(63, 0.02), 1, randn(N,1)) * sj * (Fs*0.02);
+f_t = fc0 + slope*t + 0.5*curv*(t.^2) + jit;
+
+phi = 2*pi*cumtrapz(t, f_t) + 2*pi*rand();
+am  = 1 + ap(1)*sin(2*pi*(400+rand()*6e3)*t + 2*pi*rand());
+pm  = ap(2)*sin(2*pi*(300+rand()*6e3)*t + 2*pi*rand());
+
+x = am .* exp(1j*(phi + pm));
+x = apply_burst(x, p);
+
+meta = struct('fc0',fc0,'slope',slope,'curv',curv,'sweepjit',sj,'am_pm',ap);
 end
 
-% Integrate frequency to phase:
-phi = 2*pi * cumsum(finst) / fs;
-
-% Optional oscillator offset:
-if ~isempty(osc_offset_Hz) && osc_offset_Hz ~= 0
-    phi = phi + 2*pi*osc_offset_Hz*t;
+function x = apply_burst(x, p)
+b = getf(p,'burst', struct('duty',1,'len',numel(x)));
+N = numel(x); on = round(b.duty * N);
+if on>=N || b.duty>=0.999, return; end
+gate = [ones(on,1); zeros(N-on,1)];
+gate = circshift(gate, randi([0 N-1]));
+x = x .* gate;
 end
-
-y = exp(1j * phi);
-end
+function v = getf(s,f,d), if nargin<3,d=[];end; if isempty(s)||~isstruct(s)||~isfield(s,f), v=d; else, v=s.(f); end; end

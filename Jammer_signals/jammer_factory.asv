@@ -382,86 +382,101 @@ function x = apply_frontend(x, fs, FE)
 end
 
 
-
 function y = apply_nb_columns(y, Fs, C)
-% Mini spikes that sit EXACTLY on the NB line:
-% - Purely ADDITIVE short carrier bursts at DC (pre-mix).
-% - No multiplicative envelope → no fat vertical bands.
-% - No FM → frequency extent equals one STFT bin (thin).
-% - Amplitude is matched to the line so spikes are as bright as the line.
+% Bright, thin columns on the NB line with minimal vertical spread.
 
-    y = y(:);
-    N = numel(y);                 if N < 8,  return; end
+    N  = numel(y);
+    T  = N / Fs;
 
-    % ----- how many spikes -----
-    if isfield(C,'count') && ~isempty(C.count)
-        if numel(C.count)==1, K = max(0, round(C.count));
-        else,                 K = randi([C.count(1), C.count(2)]);
-        end
+    % events per tile
+    lambda = max(0, getf(C,'rate_per_us',0)) * 1e6 * T;
+    K = max(0, round(poisson_like(lambda)));
+
+    if K==0, return; end
+
+    % strengths & shaping
+    if isfield(C,'spike_dB')
+        gain = max(0, 10^(C.spike_dB/20) - 1);
     else
-        T = N/Fs;
-        rate_per_us = fget(C,'rate_per_us', 0);         % optional legacy
-        lambda      = max(0, rate_per_us)*1e6*T;
-        % normal approx of Poisson to avoid toolbox dependence
-        K = max(0, round(lambda + sqrt(max(lambda,1e-9))*randn()));
+        gain = max(0, getf(C,'gain',0.6));
     end
-    if K == 0, return; end
+    beta   = max(0, getf(C,'beta',1.1));
+    dev    = max(0, getf(C,'fm_dev_Hz',8e4));    % very small FM
+    pstep  = max(0, getf(C,'phase_step_rad',1.6));
+    talpha = min(max(getf(C,'tukey_alpha',0.015),0),1);
+    tipw   = min(max(getf(C,'tip_weight',0.94),0),1);
 
-    % ----- geometry (make them tiny in time) -----
-    wmin_us = fget(C,'width_us_min', 0.06);
-    wmax_us = fget(C,'width_us_max', 0.10);
-    wmin    = max(3/Fs, wmin_us*1e-6);                  % ≥3 samples for stability
-    wmax    = max(wmin, wmax_us*1e-6);
-    talpha  = min(max(fget(C,'tukey_alpha',0.02),0),1); % near-rect
-    phstep  = fget(C,'phase_step_rad', 0.0);
+    wmin   = max(1e-7, getf(C,'width_us_min',0.24)*1e-6);
+    wmax   = max(wmin, getf(C,'width_us_max',0.45)*1e-6);
 
-    % ----- amplitude (match the main line brightness) -----
-    Aline   = median(abs(y));                           % robust estimate of line level
-    if Aline < 1e-9, Aline = sqrt(mean(abs(y).^2)); end
-    amp_vs  = max(0, fget(C,'amp_vs_line', 1.15));      % ≈ same as line
-    ajit    = max(0, fget(C,'amp_jitter', 0.12));
-
+    env = ones(N,1);
     add = zeros(N,1);
 
-    % keep spikes separated so they don't merge (prevents “fat” look)
-    Lmed   = round(((wmin+wmax)/2)*Fs);
-    guard  = max(2, 2*Lmed);
-    taken  = false(N,1);
-
     for k = 1:K
-        Ls = max(3, round((wmin + (wmax - wmin)*rand())*Fs));
+        W   = wmin + (wmax - wmin)*rand();
+        % --- safe center + indices (exactly L samples, always 1..N) ---
+% --- snap to STFT grid so each spike occupies ~1 time bin ---
+SNP = getf(C,'snap_to_stft',struct('enable',false));
+if isstruct(SNP) && getf(SNP,'enable',false)
+    nperseg = getf(SNP,'nperseg',64);
+    hop     = getf(SNP,'hop',8);               % 64 with 56 overlap → hop=8
+    L       = max(8, min(round(0.9*nperseg), N-2));  % ~one frame wide
+    % center on a hop boundary closest to a random position
+    c_raw   = randi([ceil(L/2), N - ceil(L/2)]);
+    c       = round(c_raw / hop) * hop;
+    c       = min(max(c, ceil(L/2)), N - ceil(L/2));
+else
+    c = randi([ceil(L/2), N - ceil(L/2)]);
+end
 
-        % pick a start index that fits and respects a guard band
-        freeIdx = find(~taken);
-        if numel(freeIdx) <= Ls+2, break; end
-        a = freeIdx(randi(numel(freeIdx)-Ls));
-        b = a + Ls - 1;
-        taken(max(1,a-guard):min(N,b+guard)) = true;
+idx = (c - floor(L/2)):(c + ceil(L/2) - 1);
+idx = idx(idx>=1 & idx<=N);   % robust clamp (avoid “Array indices…” errors)
 
-        % very peaky short window (Tukey + Gaussian tip)
-        if exist('tukeywin','file')
-            w = tukeywin(Ls, talpha);
-        else
-            w = my_tukeywin(Ls, talpha);                % your fallback
+
+
+        idx = (c-h1):(c+h2);    % length(idx) == L
+
+
+        % Near-rect window + very sharp tip (normalized 0..1)
+        w  = tukeywin(numel(idx), talpha); w = w / max(w);
+        gg = exp(-0.5*(( (1:numel(idx))' - (numel(idx)+1)/2 ) / max(1,0.04*numel(idx))).^2);
+        gg = gg / max(gg);
+        w  = (1-tipw)*w + tipw*gg;
+
+        % (1) multiplicative lift: makes the column as bright as baseline
+        env(idx) = env(idx) .* (1 + gain * w);
+
+        % (2) additive copy with tiny FM and a phase step at center
+        if beta > 0
+            tloc   = (0:numel(idx)-1)'/Fs;
+            % almost-no FM → column stays near the line
+            if dev>0
+                df    = dev * (2*rand-1);
+                seg   = y(idx) .* exp(1j*2*pi*df*(tloc - mean(tloc)));
+            else
+                seg   = y(idx);
+            end
+            % crisp PM "tick" at the peak
+            center = round(numel(idx)/2);
+            phi    = zeros(numel(idx),1);
+            phi(center:end) = pstep;
+            seg   = seg .* exp(1j*phi);
+
+            % Favor PM (keeps energy tight), tiny FM
+            add(idx) = add(idx) + beta * w .* (0.85*seg + 0.15*y(idx));
         end
-        w = w / max(w);
-        n = (1:Ls)';
-        tip = exp(-0.5*((n - (Ls+1)/2) ./ max(1,0.03*Ls)).^2);
-        tip = tip / max(tip);
-        w = max(w, tip);                                % sharper center
-
-        % spike amplitude ~ line level (with small jitter)
-        Ak = (amp_vs * (1 + ajit*randn())) * Aline;
-
-        % DC tone (pre-mix) ⇒ after x = y .* exp(j2πf_off t), it lands on the line
-        seg = Ak * w;
-        if phstep ~= 0
-            phi = zeros(Ls,1); phi(ceil(Ls/2):end) = phstep;
-            seg = seg .* exp(1j*phi);
-        end
-
-        add(a:b) = add(a:b) + seg;
     end
 
-    y = y + add;
+    y = y .* env + add;
+end
+
+function v = getf(S, name, default)
+    if isstruct(S) && isfield(S,name) && ~isempty(S.(name)), v = S.(name); else, v = default; end
+end
+
+function k = poisson_like(lambda)
+    if lambda <= 0, k = 0; return; end
+    L = exp(-lambda);  p = 1;  k = 0;
+    while p > L, k = k + 1; p = p * rand(); end
+    k = k - 1;
 end
