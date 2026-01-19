@@ -1,31 +1,32 @@
 function [x, meta] = jam_wb_prn(N, Fs, p)
-% Wideband noise/PRN jammer with gentle ripple and bursts
-fc     = getf(p,'fc', 0.0);
-bw     = getf(p,'bw', 12e6);
-ripple = getf(p,'ripple', 1.0); % dB pk-pk
+% STRONG wideband noise jammer
 
-% Start with WGN -> band-limit with FIR
-w = randn(N,1) + 1j*randn(N,1);
-M = max(255, 2*round(Fs/bw)+1);
-b = fir1(M-1, min(0.99, (bw/2)/(Fs/2)));
-s = filter(b,1,w);
+fc      = getf(p,'fc', 0.0);  % keep it centred for now
+bw_frac = getf(p,'bw_frac', 0.6 + 0.3*rand());  % 60–90% of Fs
+bw      = bw_frac * Fs;
 
-% Impose gentle passband ripple by comb-like EQ
-H = fft(s);
-L = numel(H);
-k = (0:L-1).';
-rip = (ripple/20*log(10)) * sin(2*pi*(rand()*0.02 + 0.005)*k + 2*pi*rand()); %#ok<NASGU>
-% (Keep it simple—small random tilt)
-tilt = (10^(ripple/40)) .^ linspace(-0.5,0.5,L).';
-H = H .* (1 + 0.07*(randn(L,1))) .* tilt;
-s = ifft(H, 'symmetric');
+% 1) white complex noise
+w = (randn(N,1) + 1j*randn(N,1)) / sqrt(2);
 
-t = (0:N-1).'/Fs;
-x = s .* exp(1j*(2*pi*fc*t + 2*pi*rand()));
+% 2) design wide low-pass to approximate |H(f)| ≈ 1 in [-bw/2, bw/2]
+M  = max(511, 2*round(Fs/bw)*64 + 1);     % long enough for reasonably sharp edges
+b  = fir1(M-1, (bw/2)/(Fs/2));            % normalized cutoff
+
+x = filter(b, 1, w);
+
+% 3) (optional) very gentle ripple ≤ 1 dB so it still looks flat-ish
+%    If you keep your FFT-based comb, clamp ripple strongly:
+%    ripple_db = getf(p,'ripple', 0.5);  % pk-pk <= 0.5 dB
+
+% 4) normalize to unit power (Channel_Gen will scale by JSR_dB)
+x = x ./ sqrt(mean(abs(x).^2) + 1e-12);
+
+% 5) apply bursts if you want temporal structure
 x = apply_burst(x, p);
 
-meta = struct('fc',fc,'bw',bw,'ripple',ripple);
+meta = struct('fc', fc, 'bw', bw, 'bw_frac', bw_frac);
 end
+
 
 function x = apply_burst(x, p)
 b = getf(p,'burst', struct('duty',1,'len',numel(x)));

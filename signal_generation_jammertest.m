@@ -30,9 +30,9 @@ Splits    = {'TRAIN','VAL','TEST'};
 
 % --- Choose ONE of these "Counts" styles ---
 % (A) Uniform counts per class
-Counts.TRAIN = 200;
-Counts.VAL   = 150;
-Counts.TEST  = 150;
+Counts.TRAIN = 2000;
+Counts.VAL   = 1500;
+Counts.TEST  = 1500;
 
 % Stratified C/N0 (dB-Hz) and JSR (dB) bins (uniform within bins)
 % Default bins (used when a class does not have a specific override)
@@ -51,7 +51,7 @@ JSR_bins_by_class = struct( ...
     'NoJam', [], ...  % jsr = NaN => truly no jammer
     'Chirp', [30 35 40 45 50 60 70 80], ...
     'NB',    [30 35 40 45 50 60 70 80], ...
-    'WB',    [30 35 40 45 50 60 70 80] );
+    'WB',    [40 50 60 70 80] );
 
 
 % (Optional) Chirp “families” ranges (kept from your version)
